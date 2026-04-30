@@ -51,7 +51,7 @@ LOCAL_MUTATION_TOKEN = secrets.token_urlsafe(24)
 # Polymarket has thousands of low-rate sports / esports rewards programs.
 # By default we only orderbook-fetch the top N by daily_rate (plus any
 # explicitly followed slugs); raise via --top-n to widen.
-DEFAULT_TOP_N = 80
+DEFAULT_TOP_N = 1700
 
 # Below this daily pool, the market isn't worth orderbook-fetching even if
 # it's "uncontested" — the absolute payout is too small to bother. Override
@@ -348,7 +348,10 @@ def fetch_book(token_id):
                 "tick_size": 0.01, "min_order_size": 5.0, "ts": time.time()}
 
 
-def fetch_books_parallel(token_ids, workers=16):
+def fetch_books_parallel(token_ids, workers=32):
+    """Polymarket's CLOB tolerates 32-way parallel /book calls without
+    rate-limiting in practice; raise if you've widened the snapshot to
+    cover thousands of markets and refresh has gotten too slow."""
     out = {}
     if not token_ids: return out
     with ThreadPoolExecutor(max_workers=workers) as ex:
