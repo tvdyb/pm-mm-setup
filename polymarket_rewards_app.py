@@ -53,6 +53,11 @@ LOCAL_MUTATION_TOKEN = secrets.token_urlsafe(24)
 # explicitly followed slugs); raise via --top-n to widen.
 DEFAULT_TOP_N = 80
 
+# Below this daily pool, the market isn't worth orderbook-fetching even if
+# it's "uncontested" — the absolute payout is too small to bother. Override
+# with --min-pool. Set to 0 to include every active program.
+DEFAULT_MIN_POOL_USD = 10.0
+
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36")
 HDRS = {"User-Agent": UA, "Accept": "application/json"}
@@ -197,19 +202,23 @@ def gamma_markets_by_condition_ids(condition_ids, batch=100):
 
 def gamma_markets(active=True, closed=False, archived=False, limit=500,
                   rewards_only=True, extra_params=None, top_n=None,
-                  followed_slugs=None):
+                  followed_slugs=None, min_pool_usd=None):
     """Return a list of normalized market dicts for currently-rewarded
     markets, ranked by daily_rate descending and capped to `top_n` (default
     DEFAULT_TOP_N — Polymarket has 5000+ active programs and orderbook
-    fetching all of them takes minutes). Slugs in `followed_slugs` are kept
-    even if they fall below the top_n cutoff. Pulls program list from CLOB,
-    then enriches with Gamma metadata (slug, question, clobTokenIds, negRisk).
+    fetching all of them takes minutes). Programs with daily_rate below
+    `min_pool_usd` (default DEFAULT_MIN_POOL_USD) are dropped first.
+    Slugs in `followed_slugs` are kept even if they fall below either cap.
+    Pulls program list from CLOB, then enriches with Gamma metadata
+    (slug, question, clobTokenIds, negRisk).
     """
     progs = clob_rewards_programs()
     if not progs:
         return []
+    floor = DEFAULT_MIN_POOL_USD if min_pool_usd is None else min_pool_usd
     if rewards_only:
-        cids = [c for c, p in progs.items() if (p.get("rewards_daily_rate") or 0) > 0]
+        cids = [c for c, p in progs.items()
+                if (p.get("rewards_daily_rate") or 0) >= floor]
     else:
         cids = list(progs.keys())
     # Sort programs by rate desc and cap.
@@ -704,6 +713,7 @@ def build_rows(markets, books, my_orders, theos, blocked):
 
 
 _top_n_override = {"value": None}
+_min_pool_override = {"value": None}
 
 
 def refresh_snapshot():
@@ -713,7 +723,9 @@ def refresh_snapshot():
         followed = set(load_followed())
         blocked = load_blocked()
         try:
-            mkts = gamma_markets(rewards_only=True, top_n=_top_n_override["value"],
+            mkts = gamma_markets(rewards_only=True,
+                                 top_n=_top_n_override["value"],
+                                 min_pool_usd=_min_pool_override["value"],
                                  followed_slugs=followed)
         except Exception as e:
             mkts = []
@@ -1255,10 +1267,14 @@ def main():
                     help=f"orderbook-fetch only the top N rewarded markets by "
                          f"daily rate (default {DEFAULT_TOP_N}); raise carefully — "
                          f"Polymarket has 5000+ programs, mostly tiny sports props")
+    ap.add_argument("--min-pool", type=float, default=DEFAULT_MIN_POOL_USD,
+                    help=f"skip rewards programs with daily pool below this many "
+                         f"USDC (default ${DEFAULT_MIN_POOL_USD:g}/day)")
     args = ap.parse_args()
 
     PENNY_BOT.interval = args.bot_interval
     _top_n_override["value"] = args.top_n
+    _min_pool_override["value"] = args.min_pool
 
     threading.Thread(target=snapshot_loop, args=(args.snapshot_interval,), daemon=True).start()
     PENNY_BOT.start()
