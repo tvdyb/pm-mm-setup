@@ -640,6 +640,17 @@ def build_rows(markets, books, my_orders, theos, blocked):
         usd_per_day = share * rate
         usd_per_hr = usd_per_day / 24.0
 
+        # competing_q = visible-book Q from other makers (lower bound, since
+        # the aggregated CLOB book can't distinguish our orders from peers'
+        # at the same level). When this is ~0 the market is uncontested,
+        # i.e., posting min_size at the optimal price captures ~100% of the
+        # daily pool. `if_alone_per_day` is the upper-bound rewards if so.
+        competing_q = max(0.0, tot_q - my_q)
+        EPS = 1e-6
+        uncontested = competing_q <= EPS
+        if_alone_per_day = rate if uncontested else 0.0
+        if_alone_per_hr  = if_alone_per_day / 24.0
+
         theo_yes = theos.get(slug)
         theo_y_c = theo_yes * 100.0 if theo_yes is not None else None
         edge_y = (theo_y_c - (ybb * 100.0)) if (theo_y_c is not None and ybb is not None) else None
@@ -672,9 +683,13 @@ def build_rows(markets, books, my_orders, theos, blocked):
 
             "my_q_yes": my_q_yes, "my_q_no": my_q_no, "my_q": my_q,
             "tot_q":    tot_q,
+            "competing_q":      competing_q,
+            "uncontested":      uncontested,
             "share":    share,
             "usd_per_day": usd_per_day,
             "usd_per_hr":  usd_per_hr,
+            "if_alone_per_day": if_alone_per_day,
+            "if_alone_per_hr":  if_alone_per_hr,
 
             "theo_yes":  theo_yes,
             "theo_y_c":  theo_y_c,
@@ -904,6 +919,7 @@ INDEX_HTML = """<!doctype html>
   <span class='stat' id='clobstat'></span>
   <span style='flex:1'></span>
   <label><input type='checkbox' id='hidezero'> hide $/hr=0</label>
+  <label><input type='checkbox' id='uncontested'> uncontested only (no other makers)</label>
   <button onclick='refresh()'>↻ refresh</button>
 </header>
 <div class='panel'>
@@ -949,8 +965,15 @@ async function init() {
 async function refresh() {
   let s = await getJSON('/snapshot');
   let rows = s.rows || [];
+  let uncontestedOnly = document.getElementById('uncontested').checked;
+  if (uncontestedOnly) {
+    rows = rows.filter(r => r.uncontested);
+    // When filtering to uncontested, default to ranking by largest pool.
+    if (sortKey === 'usd_per_hr') { sortKey = 'if_alone_per_hr'; sortDir = -1; }
+  }
   if (document.getElementById('hidezero').checked)
-    rows = rows.filter(r => (r.usd_per_hr||0) > 0 || (r.my_yes_total||0) > 0 || (r.my_no_total||0) > 0);
+    rows = rows.filter(r => (r.usd_per_hr||0) > 0 || (r.my_yes_total||0) > 0 || (r.my_no_total||0) > 0
+                          || (uncontestedOnly && (r.daily_rate||0) > 0));
   rows.sort((a,b) => sortDir * ((a[sortKey]??0) - (b[sortKey]??0)));
   document.getElementById('nmkt').textContent = rows.length;
   document.getElementById('hr').textContent = fmtUsd(rows.reduce((s,r)=>s+(r.usd_per_hr||0),0));
@@ -975,8 +998,11 @@ async function refresh() {
     ['slug','market', 'l'], ['daily_rate','$/day pool','r'], ['v_cents','v¢','r'],
     ['min_size','min','r'], ['yes_mid','YES mid','r'], ['no_mid','NO mid','r'],
     ['my_yes_total','my YES','r'], ['my_no_total','my NO','r'],
-    ['my_q','my Q','r'], ['tot_q','total Q','r'], ['share','share','r'],
-    ['usd_per_hr','$/hr','r'], ['theo_y_c','theo YES¢','r'], ['edge_yes','edge YES','r'],
+    ['my_q','my Q','r'], ['competing_q','others Q','r'],
+    ['share','share','r'],
+    ['usd_per_hr','$/hr','r'],
+    ['if_alone_per_hr','$/hr alone','r'],
+    ['theo_y_c','theo YES¢','r'], ['edge_yes','edge YES','r'],
     ['', 'actions', 'l']
   ];
   let html = "<table><thead><tr>" + cols.map(c =>
@@ -999,9 +1025,12 @@ async function refresh() {
     html += "<td>"+fmtN(r.my_yes_total,0)+(r.my_yes_top_px!=null?"<br><span class='small dim'>@"+fmtP(r.my_yes_top_px)+"</span>":"")+"</td>";
     html += "<td>"+fmtN(r.my_no_total,0)+(r.my_no_top_px!=null?"<br><span class='small dim'>@"+fmtP(r.my_no_top_px)+"</span>":"")+"</td>";
     html += "<td>"+fmtN(r.my_q,1)+"</td>";
-    html += "<td>"+fmtN(r.tot_q,1)+"</td>";
+    let othersCls = r.uncontested ? 'pos' : '';
+    html += "<td class='"+othersCls+"'>"+(r.uncontested ? "<b>0</b>" : fmtN(r.competing_q,1))+"</td>";
     html += "<td>"+fmtPct(r.share)+"</td>";
     html += "<td><b>"+fmtUsd(r.usd_per_hr,3)+"</b><br><span class='small dim'>"+fmtUsd(r.usd_per_day,2)+"/d</span></td>";
+    let aloneCls = (r.if_alone_per_hr||0) > 0 ? 'pos' : 'dim';
+    html += "<td class='"+aloneCls+"'>"+(r.uncontested ? "<b>"+fmtUsd(r.if_alone_per_hr,3)+"</b><br><span class='small dim'>"+fmtUsd(r.if_alone_per_day,2)+"/d</span>" : '—')+"</td>";
     html += "<td>"+fmtN(r.theo_y_c,1)+"</td>";
     let edgecls = r.edge_yes==null ? '' : (r.edge_yes>0?'pos':'neg');
     html += "<td class='"+edgecls+"'>"+(r.edge_yes!=null?(r.edge_yes>0?'+':'')+fmtN(r.edge_yes,1):'—')+"</td>";
