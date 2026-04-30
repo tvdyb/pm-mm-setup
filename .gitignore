@@ -1,0 +1,28 @@
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+private_key.txt
+
+# Local state
+polymarket_followed_markets.json
+polymarket_blocked_markets.json
+polymarket_rewards_today.json
+polymarket_overnight.json
+polymarket_api_creds.json
+
+# Logs
+*.log
+*.stdout
+
+# Trade audit dumps
+polymarket_place_*.json
+polymarket_amend_*.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
