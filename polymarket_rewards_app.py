@@ -48,6 +48,11 @@ MID_HI   = 0.90         # above this, two-sided required
 SAMPLES_PER_DAY = 1440  # one per minute
 LOCAL_MUTATION_TOKEN = secrets.token_urlsafe(24)
 
+# Polymarket has thousands of low-rate sports / esports rewards programs.
+# By default we only orderbook-fetch the top N by daily_rate (plus any
+# explicitly followed slugs); raise via --top-n to widen.
+DEFAULT_TOP_N = 80
+
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36")
 HDRS = {"User-Agent": UA, "Accept": "application/json"}
@@ -106,41 +111,143 @@ def get_clob():
 # Public read APIs (Gamma + CLOB orderbook).
 # ---------------------------------------------------------------------------
 
-def gamma_markets(active=True, closed=False, archived=False, limit=500,
-                  rewards_only=True, extra_params=None):
-    """Stream all rewards-active markets via /markets pagination. Filters on
-    rewardsDailyRate > 0 client-side because the Gamma filter for rewards is
-    not always reliable across deploys."""
-    out = []
-    offset = 0
-    seen = set()
-    while True:
-        params = {"active": str(bool(active)).lower(),
-                  "closed": str(bool(closed)).lower(),
-                  "archived": str(bool(archived)).lower(),
-                  "limit": int(limit), "offset": offset,
-                  "ascending": "false", "order": "volume24hr"}
-        if extra_params:
-            params.update(extra_params)
-        r = requests.get(f"{GAMMA_HOST}/markets", params=params,
-                         headers=HDRS, timeout=HTTP_TIMEOUT)
+_progs_cache = {"data": {}, "ts": 0.0}
+_meta_cache = {"data": {}, "ts": 0.0}
+PROGS_CACHE_S = 60   # CLOB rewards programs change on day boundaries
+META_CACHE_S  = 300  # slug/question/tokens are immutable per market
+
+
+def clob_rewards_programs():
+    """Pull every active rewards program from the CLOB. Authoritative source
+    of (rewardsMaxSpread, rewardsMinSize, daily_rate) per condition_id —
+    Gamma's /markets endpoint doesn't include the daily rate.
+
+    Response shape per entry:
+      {
+        "condition_id":      "0x…",
+        "rewards_max_spread": 4.5,        # cents
+        "rewards_min_size":   200,        # shares
+        "total_daily_rate":   50,         # USDC/day
+        "native_daily_rate":  50,
+        "rewards_config": [{...,"rate_per_day": 50,"start_date","end_date"}]
+      }
+    """
+    if time.time() - _progs_cache["ts"] < PROGS_CACHE_S and _progs_cache["data"]:
+        return _progs_cache["data"]
+    out = {}
+    cursor = ""
+    for _ in range(50):  # safety bound on pagination
+        params = {"limit": 500}
+        if cursor: params["next_cursor"] = cursor
+        r = requests.get(f"{CLOB_HOST}/rewards/markets/current",
+                         params=params, headers=HDRS, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
-        arr = r.json() or []
-        if not arr:
+        d = r.json() or {}
+        for entry in d.get("data") or []:
+            cid = (entry.get("condition_id") or "").lower()
+            if not cid: continue
+            out[cid] = {
+                "condition_id": cid,
+                "rewards_max_spread_c": _safe_float(entry.get("rewards_max_spread")),
+                "rewards_min_size":     _safe_float(entry.get("rewards_min_size")),
+                "rewards_daily_rate":   _safe_float(entry.get("total_daily_rate"))
+                                        or _safe_float(entry.get("native_daily_rate")),
+                "rewards_config":       entry.get("rewards_config") or [],
+            }
+        cursor = d.get("next_cursor") or ""
+        if not cursor or cursor in ("LTE=", "MA=="):  # base64 sentinels seen in CLOB v2
             break
-        for m in arr:
-            mid = str(m.get("id") or "")
-            if mid in seen:
+    _progs_cache["data"] = out
+    _progs_cache["ts"] = time.time()
+    return out
+
+
+def gamma_markets_by_condition_ids(condition_ids, batch=100):
+    """Fetch market metadata for a set of condition_ids. Gamma /markets
+    accepts repeated `condition_ids=` so we batch. Caches per condition_id
+    for META_CACHE_S since slug/question/tokens are immutable."""
+    out = {}
+    miss = []
+    now = time.time()
+    cache_fresh = (now - _meta_cache["ts"]) < META_CACHE_S
+    for cid in condition_ids:
+        cached = _meta_cache["data"].get(cid)
+        if cached and cache_fresh:
+            out[cid] = cached
+        else:
+            miss.append(cid)
+    for i in range(0, len(miss), batch):
+        chunk = miss[i:i+batch]
+        params = [("condition_ids", c) for c in chunk]
+        params.append(("limit", str(batch * 2)))
+        try:
+            r = requests.get(f"{GAMMA_HOST}/markets", params=params,
+                             headers=HDRS, timeout=HTTP_TIMEOUT)
+            r.raise_for_status()
+            for m in (r.json() or []):
+                cid = (m.get("conditionId") or "").lower()
+                if cid:
+                    out[cid] = m
+                    _meta_cache["data"][cid] = m
+        except Exception:
+            continue
+    _meta_cache["ts"] = now
+    return out
+
+
+def gamma_markets(active=True, closed=False, archived=False, limit=500,
+                  rewards_only=True, extra_params=None, top_n=None,
+                  followed_slugs=None):
+    """Return a list of normalized market dicts for currently-rewarded
+    markets, ranked by daily_rate descending and capped to `top_n` (default
+    DEFAULT_TOP_N — Polymarket has 5000+ active programs and orderbook
+    fetching all of them takes minutes). Slugs in `followed_slugs` are kept
+    even if they fall below the top_n cutoff. Pulls program list from CLOB,
+    then enriches with Gamma metadata (slug, question, clobTokenIds, negRisk).
+    """
+    progs = clob_rewards_programs()
+    if not progs:
+        return []
+    if rewards_only:
+        cids = [c for c, p in progs.items() if (p.get("rewards_daily_rate") or 0) > 0]
+    else:
+        cids = list(progs.keys())
+    # Sort programs by rate desc and cap.
+    cids.sort(key=lambda c: -(progs[c].get("rewards_daily_rate") or 0))
+    cap = top_n if top_n is not None else DEFAULT_TOP_N
+    cids_top = cids[:cap]
+    meta = gamma_markets_by_condition_ids(cids_top)
+    out = []
+    for cid in cids_top:
+        prog = progs[cid]
+        m = meta.get(cid)
+        if not m:
+            continue
+        if active and not m.get("active"): continue
+        if not closed and m.get("closed"): continue
+        if not archived and m.get("archived"): continue
+        norm = _normalize_market(m)
+        norm["rewards_max_spread_c"] = prog["rewards_max_spread_c"]
+        norm["rewards_min_size"]     = prog["rewards_min_size"]
+        norm["rewards_daily_rate"]   = prog["rewards_daily_rate"]
+        out.append(norm)
+    # Pull in followed-slug markets even if they're below the cap.
+    if followed_slugs:
+        have = {m["slug"] for m in out}
+        for slug in followed_slugs:
+            if slug in have: continue
+            try:
+                m = gamma_market_by_slug(slug)
+            except Exception:
                 continue
-            seen.add(mid)
-            if rewards_only and not _has_active_rewards(m):
-                continue
-            out.append(_normalize_market(m))
-        if len(arr) < limit:
-            break
-        offset += limit
-        if offset >= 5000:  # sanity cap
-            break
+            if not m: continue
+            cid = (m.get("condition_id") or "").lower()
+            prog = progs.get(cid)
+            if prog:
+                m["rewards_max_spread_c"] = prog["rewards_max_spread_c"]
+                m["rewards_min_size"]     = prog["rewards_min_size"]
+                m["rewards_daily_rate"]   = prog["rewards_daily_rate"]
+            out.append(m)
     return out
 
 
@@ -152,48 +259,6 @@ def gamma_market_by_slug(slug):
     if not arr:
         return None
     return _normalize_market(arr[0])
-
-
-def _has_active_rewards(m):
-    rate = _market_daily_rate(m)
-    if rate is None or rate <= 0:
-        return False
-    spread = _safe_float(m.get("rewardsMaxSpread"))
-    min_sz = _safe_float(m.get("rewardsMinSize"))
-    return spread is not None and spread > 0 and min_sz is not None and min_sz > 0
-
-
-def _market_daily_rate(m):
-    arr = m.get("clobRewards") or []
-    if isinstance(arr, str):
-        try:
-            arr = json.loads(arr)
-        except Exception:
-            arr = []
-    today = dt.datetime.now(dt.timezone.utc)
-    best = 0.0
-    for r in arr or []:
-        try:
-            start = _parse_iso(r.get("startDate"))
-            end   = _parse_iso(r.get("endDate"))
-            if start and start > today: continue
-            if end and end < today: continue
-            v = float(r.get("rewardsDailyRate") or 0)
-            if v > best: best = v
-        except Exception:
-            continue
-    if best > 0:
-        return best
-    direct = _safe_float(m.get("rewardsDailyRate"))
-    return direct
-
-
-def _parse_iso(s):
-    if not s: return None
-    try:
-        return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except Exception:
-        return None
 
 
 def _safe_float(x):
@@ -230,7 +295,8 @@ def _normalize_market(m):
         "outcome_no_price":  _safe_float((outcome_prices or [None, None])[1]) if len(outcome_prices or []) > 1 else None,
         "rewards_max_spread_c": _safe_float(m.get("rewardsMaxSpread")),
         "rewards_min_size":     _safe_float(m.get("rewardsMinSize")),
-        "rewards_daily_rate":   _market_daily_rate(m),
+        # daily_rate populated by gamma_markets() from CLOB rewards programs
+        "rewards_daily_rate":   None,
         "best_bid": _safe_float(m.get("bestBid")),
         "best_ask": _safe_float(m.get("bestAsk")),
         "last_trade_price": _safe_float(m.get("lastTradePrice")),
@@ -622,6 +688,9 @@ def build_rows(markets, books, my_orders, theos, blocked):
     return rows
 
 
+_top_n_override = {"value": None}
+
+
 def refresh_snapshot():
     t0 = time.time()
     errors = []
@@ -629,21 +698,11 @@ def refresh_snapshot():
         followed = set(load_followed())
         blocked = load_blocked()
         try:
-            mkts = gamma_markets(rewards_only=True)
+            mkts = gamma_markets(rewards_only=True, top_n=_top_n_override["value"],
+                                 followed_slugs=followed)
         except Exception as e:
             mkts = []
             errors.append(f"gamma: {e}")
-        # union with explicitly followed markets (even if rewards_only filter rejects them)
-        if followed:
-            for slug in followed:
-                if any(m["slug"] == slug for m in mkts):
-                    continue
-                try:
-                    m = gamma_market_by_slug(slug)
-                    if m is not None:
-                        mkts.append(m)
-                except Exception as e:
-                    errors.append(f"gamma slug {slug}: {e}")
         token_ids = []
         for m in mkts:
             if m["yes_token"]: token_ids.append(m["yes_token"])
@@ -1156,13 +1215,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=5050)
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--snapshot-interval", type=float, default=2.5,
+    ap.add_argument("--snapshot-interval", type=float, default=5.0,
                     help="seconds between full market refreshes")
     ap.add_argument("--bot-interval", type=float, default=30,
                     help="auto-pennying cycle period (seconds)")
+    ap.add_argument("--top-n", type=int, default=DEFAULT_TOP_N,
+                    help=f"orderbook-fetch only the top N rewarded markets by "
+                         f"daily rate (default {DEFAULT_TOP_N}); raise carefully — "
+                         f"Polymarket has 5000+ programs, mostly tiny sports props")
     args = ap.parse_args()
 
     PENNY_BOT.interval = args.bot_interval
+    _top_n_override["value"] = args.top_n
 
     threading.Thread(target=snapshot_loop, args=(args.snapshot_interval,), daemon=True).start()
     PENNY_BOT.start()
