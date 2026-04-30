@@ -995,8 +995,11 @@ async function refresh() {
   log.innerHTML = (bot.events||[]).slice(-40).reverse().map(e =>
       "<div>"+new Date(e[0]*1000).toLocaleTimeString()+" — "+escape(e[1])+"</div>").join('');
   let cols = [
-    ['slug','market', 'l'], ['daily_rate','$/day pool','r'], ['v_cents','v¢','r'],
-    ['min_size','min','r'], ['yes_mid','YES mid','r'], ['no_mid','NO mid','r'],
+    ['slug','market', 'l'],
+    ['daily_rate','Rewards $/day','r'],
+    ['v_cents','Max Spread','r'],
+    ['min_size','Min Shares','r'],
+    ['yes_mid','YES mid','r'], ['no_mid','NO mid','r'],
     ['my_yes_total','my YES','r'], ['my_no_total','my NO','r'],
     ['my_q','my Q','r'], ['competing_q','others Q','r'],
     ['share','share','r'],
@@ -1018,7 +1021,7 @@ async function refresh() {
             + (r.neg_risk? "&nbsp;<span class='badge b-blk'>NEG-RISK</span>":"")
             +"</span></td>";
     html += "<td>"+fmtUsd(r.daily_rate,1)+"</td>";
-    html += "<td>"+fmtN(r.v_cents,1)+"</td>";
+    html += "<td>±"+fmtN(r.v_cents,1)+"¢</td>";
     html += "<td>"+fmtN(r.min_size,0)+"</td>";
     html += "<td>"+fmtP(r.yes_mid)+"<br><span class='small dim'>"+fmtP(r.yes_best_bid)+" / "+fmtP(r.yes_best_ask)+"</span></td>";
     html += "<td>"+fmtP(r.no_mid)+"<br><span class='small dim'>"+fmtP(r.no_best_bid)+" / "+fmtP(r.no_best_ask)+"</span></td>";
